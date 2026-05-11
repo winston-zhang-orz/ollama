@@ -33,3 +33,9 @@ target_link_directories(ggml-gcu PRIVATE ${TOPS_INSTALL_DIR}/lib)
 target_link_libraries(ggml-gcu PRIVATE topsaten topsrt)
 
 message(STATUS "ggml-gcu: TOPS_INSTALL_DIR = ${TOPS_INSTALL_DIR}")
+
+# Ollama vendored build: enable the Ollama-flavoured API surface.
+# graph_compute(backend, cgraph, batch_size) instead of upstream's
+# 2-arg variant, plus device-props fields (id, library, driver, compute)
+# that Ollama's patches 0015/0018/0024 mandate.
+target_compile_definitions(ggml-gcu PRIVATE GGML_GCU_OLLAMA_API)
