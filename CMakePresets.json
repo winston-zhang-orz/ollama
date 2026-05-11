@@ -94,6 +94,14 @@
       }
     },
     {
+      "name": "GCU",
+      "inherits": [ "Default" ],
+      "cacheVariables": {
+        "GGML_GCU": "ON",
+        "OLLAMA_RUNNER_DIR": "gcu"
+      }
+    },
+    {
       "name": "MLX",
       "inherits": [ "Default" ],
       "cacheVariables": {
@@ -177,6 +185,11 @@
       "name": "Vulkan",
       "targets": [ "ggml-vulkan" ],
       "configurePreset": "Vulkan"
+    },
+    {
+      "name": "GCU",
+      "targets": [ "ggml-gcu" ],
+      "configurePreset": "GCU"
     },
     {
       "name": "MLX",

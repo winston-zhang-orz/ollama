@@ -194,6 +194,20 @@ if(NOT APPLE)
     endif()
 endif()
 
+# --- Enflame GCU (TOPS) backend ---------------------------------------------
+# Gated by GGML_GCU=ON (set by the "GCU" preset). Requires the Topsrider SDK
+# under /opt/tops (or TOPS_INSTALL_DIR). libtopsrt.so must be installed
+# separately on the runtime host — we cannot redistribute it.
+# Note: ggml_add_backend(GCU) inside ml/backend/ggml/ggml/src/CMakeLists.txt
+# already calls add_subdirectory(ggml-gcu), so the target exists by this point.
+if(GGML_GCU AND TARGET ggml-gcu)
+    target_include_directories(ggml-gcu PRIVATE ${GGML_INCLUDE_DIRS})
+    install(TARGETS ggml-gcu
+        RUNTIME DESTINATION ${OLLAMA_INSTALL_DIR} COMPONENT GCU
+        LIBRARY DESTINATION ${OLLAMA_INSTALL_DIR} COMPONENT GCU
+    )
+endif()
+
 option(MLX_ENGINE "Enable MLX backend" OFF)
 if(MLX_ENGINE)
     message(STATUS "Setting up MLX (this takes a while...)")
