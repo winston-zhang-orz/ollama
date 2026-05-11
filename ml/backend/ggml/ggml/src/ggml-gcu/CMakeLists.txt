@@ -32,8 +32,4 @@ target_include_directories(ggml-gcu PRIVATE
 target_link_directories(ggml-gcu PRIVATE ${TOPS_INSTALL_DIR}/lib)
 target_link_libraries(ggml-gcu PRIVATE topsaten topsrt)
 
-# Compiling against Ollama's patched ggml headers (no-alloc mode, batch_size hint,
-# GPU UUIDs, etc). Toggles the GGML_GCU_OLLAMA_API #ifdef gates in ggml-gcu.cpp.
-target_compile_definitions(ggml-gcu PRIVATE GGML_GCU_OLLAMA_API)
-
 message(STATUS "ggml-gcu: TOPS_INSTALL_DIR = ${TOPS_INSTALL_DIR}")

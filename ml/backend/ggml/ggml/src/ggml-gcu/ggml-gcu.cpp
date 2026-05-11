@@ -1928,36 +1928,45 @@ static bool gcu_op_cpy(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
 // the cache is logically a 2D table of (n_heads * max_kv) rows of
 // head_dim elements. Requires the tensor to be contiguous.
 //
-// llama.cpp stores K/V in F16 caches but produces F32 K/V vectors during
-// compute, so src->type != dst->type is the common case. topsatenIndexPut
-// requires matching dtypes, so we cast src into a per-context scratch
-// when types differ.
+// MVP-6 strategy: use topsatenIndexPut as a fully-on-device scatter. Two
+// SDK constraints we re-probed in 2026-05:
+//   1. topsatenIndexPut REJECTS I64 indices ("indice data type not support: 11")
+//      but accepts I32. ggml KV caches use I64 indices. We cast I64 -> I32
+//      with topsatenTo on the compute stream (queued, async).
+//   2. topsatenIndexPut REQUIRES self and value to share dtype. ggml writes
+//      F32 K/V vectors into the F16 cache, so we cast value to dst's dtype
+//      via topsatenTo before the scatter (also queued).
+// At the cache shapes we measured (F16 [4096..32768, 128] with R in [1..64])
+// the op completes successfully and is fully overlapped with the rest of
+// the compute stream — no per-call sync, no host roundtrip. This is the
+// fast-path replacement for the MVP-3b probe (manual D2D memcpy loop)
+// which was 2-5x slower than -nkvo because of the synchronous H2D index
+// readback that drained the layer pipeline.
+//
+// Earlier IndexPut probe (MVP-3) failed only because it passed I64 indices
+// directly; the F16 dst + tall self combination is supported once indices
+// are I32.
 static bool gcu_op_set_rows(ggml_backend_gcu_context * ctx, ggml_tensor * node) {
     ggml_tensor * src = node->src[0];
     ggml_tensor * idx = node->src[1];
     ggml_tensor * dst = node->src[2];
 
-    // MVP-3b strategy: bypass topsatenIndexPut (which rejects ggml's KV
-    // cache shapes at runtime) and write each row with a manual D2D
-    // memcpy. The indices live on device so we read them to host first,
-    // then issue n_rows memcpyAsync calls. Cheap for typical token counts
-    // (1 for decode, ~prompt_len for prefill).
+    const int64_t n_rows  = idx->ne[0];
+    const int64_t row_len = dst->ne[0];
 
-    const int64_t n_rows   = idx->ne[0];
-    const size_t  row_size = (size_t) dst->ne[0] * ggml_type_size(dst->type);
-
-    // If src and dst differ in dtype, cast src to dst dtype into a
-    // scratch first; then we memcpy from the scratch.
+    // --- 1. Value tensor: cast src -> dst dtype if needed. ----------------
+    // topsatenIndexPut requires self.dtype == value.dtype. ggml's KV write
+    // is typically F32 src into F16 dst.
     void * cast_buf = nullptr;
     size_t cast_bytes = 0;
-    const void * src_data = src->data;
+    void * value_data = src->data;
     if (src->type != dst->type) {
-        const int64_t n_elem = n_rows * dst->ne[0];
+        const int64_t n_elem = n_rows * row_len;
         cast_bytes = (size_t) n_elem * ggml_type_size(dst->type);
         cast_buf   = ctx->pool.alloc(cast_bytes);
 
-        int64_t  v_d[2] = { n_rows, dst->ne[0] };
-        int64_t  v_s[2] = { dst->ne[0], 1 };
+        int64_t v_d[2] = { n_rows, row_len };
+        int64_t v_s[2] = { row_len, 1 };
         topsatenTensor src_view (topsatenSize_t(v_d, 2), topsatenSize_t(v_s, 2),
                                  ggml_to_topsaten_dtype(src->type), src->data);
         topsatenTensor cast_view(topsatenSize_t(v_d, 2), topsatenSize_t(v_s, 2),
@@ -1966,35 +1975,60 @@ static bool gcu_op_set_rows(ggml_backend_gcu_context * ctx, ggml_tensor * node) 
         TOPSATEN_CHECK(topsatenTo(cast_view, src_view, target,
                                   /*non_blocking=*/false, /*copy=*/true,
                                   TOPSATEN_MEMORY_CONTIGUOUS, ctx->compute_stream));
-        src_data = cast_buf;
+        value_data = cast_buf;
     }
 
-    // Read indices to host. Both I32 and I64 supported; convert to int64
-    // uniformly for the addressing math.
-    std::vector<int64_t> idx_host(n_rows);
-    if (idx->type == GGML_TYPE_I32) {
-        std::vector<int32_t> idx_i32(n_rows);
-        TOPS_CHECK(topsMemcpy(idx_i32.data(), idx->data,
-                              (size_t) n_rows * sizeof(int32_t),
-                              topsMemcpyDeviceToHost));
-        for (int64_t i = 0; i < n_rows; i++) idx_host[i] = (int64_t) idx_i32[i];
+    // --- 2. Index tensor: cast I64 -> I32 if needed (queued on compute). --
+    // ggml emits I64 indices; topsatenIndexPut requires I32. The cast
+    // produces n_rows*4 bytes and runs entirely on the compute stream, so
+    // the index buffer is ready exactly when IndexPut consumes it.
+    void * idx_buf       = idx->data;
+    void * idx_cast_buf  = nullptr;
+    size_t idx_cast_bytes = 0;
+    topsatenDataType_t idx_dtype = TOPSATEN_DATA_I32;
+    if (idx->type == GGML_TYPE_I64) {
+        idx_cast_bytes = (size_t) n_rows * sizeof(int32_t);
+        idx_cast_buf   = ctx->pool.alloc(idx_cast_bytes);
+
+        int64_t id[1] = { n_rows };
+        int64_t is[1] = { 1 };
+        topsatenTensor src_view (topsatenSize_t(id, 1), topsatenSize_t(is, 1),
+                                 TOPSATEN_DATA_I64, idx->data);
+        topsatenTensor cast_view(topsatenSize_t(id, 1), topsatenSize_t(is, 1),
+                                 TOPSATEN_DATA_I32, idx_cast_buf);
+        topsatenDataType_t target = TOPSATEN_DATA_I32;
+        TOPSATEN_CHECK(topsatenTo(cast_view, src_view, target,
+                                  /*non_blocking=*/false, /*copy=*/true,
+                                  TOPSATEN_MEMORY_CONTIGUOUS, ctx->compute_stream));
+        idx_buf = idx_cast_buf;
     } else {
-        TOPS_CHECK(topsMemcpy(idx_host.data(), idx->data,
-                              (size_t) n_rows * sizeof(int64_t),
-                              topsMemcpyDeviceToHost));
+        // ggml emits I32 too in some paths; pass through.
+        GGML_ASSERT(idx->type == GGML_TYPE_I32);
     }
 
-    char * dst_base = (char *) dst->data;
-    const char * src_base = (const char *) src_data;
-    for (int64_t i = 0; i < n_rows; i++) {
-        const int64_t dst_row = idx_host[i];
-        TOPS_CHECK(topsMemcpyAsync(dst_base + (size_t) dst_row * row_size,
-                                   src_base + (size_t) i * row_size,
-                                   row_size,
-                                   topsMemcpyDeviceToDevice, ctx->compute_stream));
-    }
+    // --- 3. Build topsatenTensor descriptors and call IndexPut. -----------
+    // Flatten dst to [n_dst_rows, row_len]; src/value to [n_rows, row_len].
+    const int64_t n_dst_rows = dst->ne[1] * dst->ne[2] * dst->ne[3];
+    int64_t sd[2] = { n_dst_rows, row_len };
+    int64_t ss[2] = { row_len, 1 };
+    int64_t vd[2] = { n_rows, row_len };
+    int64_t vs[2] = { row_len, 1 };
+    int64_t id[1] = { n_rows };
+    int64_t is[1] = { 1 };
 
-    gcu_release_scratch(ctx, cast_buf, cast_bytes);
+    topsatenTensor self_t(topsatenSize_t(sd, 2), topsatenSize_t(ss, 2),
+                          ggml_to_topsaten_dtype(dst->type), dst->data);
+    topsatenTensor val_t (topsatenSize_t(vd, 2), topsatenSize_t(vs, 2),
+                          ggml_to_topsaten_dtype(dst->type), value_data);
+    topsatenTensor idx_t (topsatenSize_t(id, 1), topsatenSize_t(is, 1),
+                          idx_dtype, idx_buf);
+
+    std::vector<topsatenTensor> indices = { idx_t };
+    TOPSATEN_CHECK(topsatenIndexPut(self_t, indices, val_t,
+                                    /*accumulate=*/false, ctx->compute_stream));
+
+    gcu_release_scratch(ctx, cast_buf,     cast_bytes);
+    gcu_release_scratch(ctx, idx_cast_buf, idx_cast_bytes);
     return true;
 }
 
@@ -3262,15 +3296,20 @@ static bool ggml_backend_gcu_device_supports_op(ggml_backend_dev_t /*dev*/, cons
             if (!src || !idx || !dst) return false;
             if (idx->type != GGML_TYPE_I32 && idx->type != GGML_TYPE_I64) return false;
             if (!gcu_dtype_supported(src->type) || !gcu_dtype_supported(dst->type)) return false;
-            // MVP-2 explicit decision: F16 destination is the KV cache.
-            // The MVP-3b probe (manual D2D memcpy loop bypassing
-            // topsatenIndexPut) was 2-5x slower than -nkvo because of
-            // per-call sync H2D index transfer. Refuse F16 dst here so
-            // KV cache stays on CPU; users pass -nkvo to opt in. F32 dst
-            // stays accepted for the small number of test-backend-ops
-            // cases that exercise it.
-            if (dst->type != GGML_TYPE_F32) return false;
-            if (src->type != dst->type) return false;
+            // MVP-6: F16 destination is the KV cache. The previous
+            // F32-dst-only gate refused the cache and forced -nkvo. The
+            // current handler uses topsatenIndexPut after casting I64
+            // indices to I32 (an SDK constraint we re-probed in 2026-05).
+            // Cross-dtype value (F32 src into F16 dst) is also handled
+            // via an on-stream topsatenTo cast. We accept the dtype
+            // combinations our handler implements: F32/F16/BF16 dst with
+            // any of those (or each other) as src.
+            if (dst->type != GGML_TYPE_F32 &&
+                dst->type != GGML_TYPE_F16 &&
+                dst->type != GGML_TYPE_BF16) return false;
+            if (src->type != GGML_TYPE_F32 &&
+                src->type != GGML_TYPE_F16 &&
+                src->type != GGML_TYPE_BF16) return false;
             if (!ggml_is_contiguous(src) || !ggml_is_contiguous(dst)) return false;
             if (src->ne[0] != dst->ne[0]) return false;
             if (idx->ne[1] != 1 || idx->ne[2] != 1 || idx->ne[3] != 1) return false;
