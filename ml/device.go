@@ -488,7 +488,8 @@ func FlashAttentionSupported(l []DeviceInfo) bool {
 			gpu.Name == "Metal" || gpu.Library == "Metal" ||
 			(gpu.Library == "CUDA" && gpu.DriverMajor >= 7 && !(gpu.ComputeMajor == 7 && gpu.ComputeMinor == 2)) ||
 			gpu.Library == "ROCm" ||
-			gpu.Library == "Vulkan"
+			gpu.Library == "Vulkan" ||
+			gpu.Library == "GCU"
 
 		if !supportsFA {
 			return false
@@ -566,7 +567,7 @@ func (d DeviceInfo) PreferredLibrary(other DeviceInfo) bool {
 	// TODO in the future if we find Vulkan is better than ROCm on some devices
 	// that implementation can live here.
 
-	if d.Library == "CUDA" || d.Library == "ROCm" {
+	if d.Library == "CUDA" || d.Library == "ROCm" || d.Library == "GCU" {
 		return true
 	}
 	return false
@@ -588,6 +589,22 @@ func (d DeviceInfo) updateVisibleDevicesEnv(env map[string]string, mustFilter bo
 			return
 		}
 		envVar = "CUDA_VISIBLE_DEVICES"
+	case "GCU":
+		// Enflame GCU: use TOPS_VISIBLE_DEVICES (topsrt honors this env var).
+		// topsrt expects numeric device indices (e.g. "0,1"), not the
+		// human-readable id "GCU0" — strip the "GCU" prefix.
+		envVar = "TOPS_VISIBLE_DEVICES"
+		v, existing := env[envVar]
+		if existing {
+			v = v + ","
+		}
+		idStr := d.FilterID
+		if idStr == "" {
+			idStr = d.ID
+		}
+		idStr = strings.TrimPrefix(idStr, "GCU")
+		env[envVar] = v + idStr
+		return
 	default:
 		// Vulkan is not filtered via env var, but via scheduling decisions
 		return
