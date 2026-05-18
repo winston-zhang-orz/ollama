@@ -213,9 +213,36 @@ struct ggml_backend_gcu_context {
     // queue without per-op host synchronize and the next op's pool.alloc
     // can't reuse a buffer the previous op's kernel is still reading.
     std::vector<std::pair<void *, size_t>> deferred_frees;
+    size_t                                  deferred_bytes = 0;
+
+    // Cap outstanding deferred scratch at this many bytes per graph_compute.
+    // Real-model graphs stay well under this (a Llama-3.2-1B prefill peaks at
+    // tens of MB of deferred FA scratch); the cap only triggers in
+    // pathological graphs like test-backend-ops perf-mode, which duplicates
+    // a single op thousands of times into one graph and would otherwise
+    // accumulate tens of GiB of outstanding scratch before the end-of-graph
+    // drain. When we hit the cap we synchronize the compute stream and
+    // recycle the slabs through the pool so subsequent allocs can reuse them.
+    // 512 MiB is comfortably above any real-model peak we've measured and
+    // also stays clear of the 1 GiB smoke-mode pool-retention sanity check.
+    static constexpr size_t deferred_bytes_cap = (size_t) 512 << 20; // 512 MiB
 
     void defer_free(void * p, size_t sz) {
-        if (p) deferred_frees.emplace_back(p, sz);
+        if (!p) return;
+        deferred_frees.emplace_back(p, sz);
+        deferred_bytes += sz;
+        if (deferred_bytes > deferred_bytes_cap) {
+            // Block until queued kernels complete, then return slabs to the
+            // pool so the next op's alloc can reuse them. This is a no-op in
+            // steady state for real models; it only ever fires for synthetic
+            // benchmark graphs that fan a tiny op out thousands of times.
+            TOPS_CHECK(topsStreamSynchronize(compute_stream));
+            for (auto & kv : deferred_frees) {
+                pool.free(kv.first, kv.second);
+            }
+            deferred_frees.clear();
+            deferred_bytes = 0;
+        }
     }
 
     explicit ggml_backend_gcu_context(int32_t dev) : device(dev), pool(dev) {
@@ -622,6 +649,7 @@ static enum ggml_status ggml_backend_gcu_graph_compute(ggml_backend_t backend, s
         ctx->pool.free(kv.first, kv.second);
     }
     ctx->deferred_frees.clear();
+    ctx->deferred_bytes = 0;
 
     return status;
 }
